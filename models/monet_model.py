@@ -6,6 +6,10 @@ from torch import nn, optim
 
 from .base_model import BaseModel
 from . import networks
+from .inverse_graphics import Mask2Cube, Cube2Mask
+import os.path as osp
+from imageio import imwrite
+import numpy as np
 
 
 class MONetModel(BaseModel):
@@ -46,6 +50,14 @@ class MONetModel(BaseModel):
             opt.input_nc = 4
 
         self.loss_names = ['E', 'D', 'mask']
+
+        if opt.refine_motion:
+            self.loss_names.append('bce')
+
+        if opt.physics_loss:
+            self.loss_names.append('physics')
+            # self.loss_names.append('prim_constant')
+
         self.opt = opt
         self.opt.num_slots = 5
         self.visual_names = [['{}m{}'.format(j, i) for i in range(opt.num_slots)] + \
@@ -58,6 +70,17 @@ class MONetModel(BaseModel):
         self.model_names = ['Attn', 'CVAE']
         self.netAttn = networks.init_net(networks.Attention(opt.input_nc * opt.frames, opt.frames, ngf=2*opt.z_dim), gpu_ids=self.gpu_ids)
         self.netCVAE = networks.init_net(networks.ComponentVAE(opt.input_nc, opt.z_dim, frames=opt.frames), gpu_ids=self.gpu_ids)
+        snapshot = torch.load("/data/vision/billf/scratch/yilundu/adept/adept_seg3d/cachedir/smoketest/model_43000")
+        self.mask2prim = Mask2Cube()
+        self.prim2mask = Cube2Mask()
+        self.mask2prim.load_state_dict(snapshot['mask2cube_state_dict'])
+        self.prim2mask.load_state_dict(snapshot['cube2mask_state_dict'])
+        self.mask2prim = self.mask2prim.cuda().eval()
+        self.prim2mask = self.prim2mask.cuda().eval()
+        # The camera these models are trained at is positioned at (5.266, 0, 2.462)
+        self.camera_pose = torch.Tensor([5.266, 0, 2.462]).to(self.device)
+
+        self.counter = 0
         self.eps = torch.finfo(torch.float).eps
         # define networks; you can use opt.isTrain to specify different behaviors for training and test.
         if self.isTrain:  # only defined during training time
@@ -77,7 +100,8 @@ class MONetModel(BaseModel):
             self.x = input
             size = self.x.size()
             self.im_size = size
-            self.x = self.x.view(-1, *size[3:])
+            self.x = self.x.view(-1, *size[2:])
+            self.x = self.x.to(self.device)
         else:
             input, seg_im = input
             self.x = input.to(self.device)
@@ -155,9 +179,90 @@ class MONetModel(BaseModel):
             m.append(m_k)
             m_tilde_logits.append(m_tilde_k_logits)
 
-        import pdb
-        pdb.set_trace()
         self.decode_objs = torch.cat(decode_objs, dim=1)
+
+        if self.opt.physics_loss:
+            masks = self.decode_objs.exp()
+            select_mask = masks
+
+            # For now let's use the threshold pixel of 50
+            mask_valid = select_mask.sum(dim=[2, 3]) > 50
+            s = mask_valid.size()
+            sm = select_mask.size()
+            select_mask = select_mask.view(sm[0]*sm[1], 1, sm[2], sm[3])
+
+            prim = self.mask2prim(select_mask)
+            prim = prim.view(-1, 3, s[1], 7)
+
+            # loss_prim_constant = torch.pow(prim[:, :, :, 2:] - prim[:, :, :, 2:].mean(dim=1, keepdim=True), 2).mean()
+            # self.loss_prim_constant = 10 * loss_prim_constant
+
+            # prim_diff_pos = prim[:, 1, :2] - prim[:, 0, :2]
+            # prim_next = torch.cat([prim[:, 1, :2] + prim_diff_pos, (prim[:, 1, 2:] + prim[:, 0, 2:]) / 2.], dim=1)
+            prim_next = prim[:, 1].contiguous() + (prim[:, 1] - prim[:, 0])
+
+            s = prim_next.size()
+            prim_next = prim_next.view(-1, 7)
+
+            mask_pred = self.prim2mask(prim_next)
+            ms = mask_pred.size()
+            mask_pred = mask_pred.view(s[0], s[1], *ms[1:])
+            prim_next = prim_next.view(*s)
+
+            # Use the last state to infer the set of valid objects
+            mask_valid = mask_valid.view(-1, 3, s[1])[:, 1, :]
+            dist = torch.norm(prim_next[:, :, :3] - self.camera_pose[None, None, :], p=2, dim=2)
+
+            dist_idx = torch.argsort(dist, dim=1)
+            mask_pred_total = torch.zeros_like(mask_pred[:, 0:1])
+            mask_pred_filter = torch.zeros_like(mask_pred)
+            select_mask = select_mask.view(-1, 3, sm[1], 1, sm[2], sm[3])
+            # Filter through each element of the predict mask based off distance to handle occlusions between objects
+
+            # dist_idx is size
+            # 6 x 3
+            # mask_valid is also size
+            # 6 x 3
+            # for i in range(dist_idx.size(0)):
+            #     for j in range(dist_idx.size(1)):
+            #     # Could probably try to parallelize this operation
+            #         select_idx = dist_idx[i, j]
+            #         valid_mask = (mask_pred_total[i, 0] < 0.4).float()
+            #         mask_pred_filter[i, select_idx] = mask_pred[i, select_idx] * valid_mask * mask_valid[i, select_idx]
+            #         mask_pred_total[i, 0] = mask_pred_total[i, 0] + mask_pred[i, select_idx] * mask_valid[i, select_idx] * valid_mask
+
+            # Some code for debugging values
+            # init_image = select_mask.detach().cpu().numpy()
+            # s = init_image.shape
+            # init_image = init_image.reshape((s[2] * s[0] * s[1], s[3]))
+            # imwrite("init_im.png", init_image)
+
+            # select_mask_im = select_mask[:, :, :, 0].detach().cpu().numpy()
+            # mask_pred_filter_im = mask_pred_filter[:, :, 0].detach().cpu().numpy()
+
+            # for i in range(select_mask_im.shape[0]):
+            #     select_mask_im_i = select_mask_im[i]
+            #     mask_pred_filter_im_i = mask_pred_filter_im[i]
+            #     joint_im = np.concatenate([select_mask_im_i, mask_pred_filter_im_i[None, :]], axis=0)
+            #     joint_im = joint_im.transpose((0, 2, 1, 3))
+            #     s = joint_im.shape
+            #     joint_im = joint_im.reshape((s[0]*s[1], s[2]*s[3]))
+            #     imwrite(osp.join("masks", "joint_{}.png".format(self.counter)), joint_im)
+            #     self.counter += 1
+
+            # if self.counter == 50:
+            #     assert False
+
+            # Make the masks the same
+            # mask_label = (mask_pred_filter > 0.3).float()
+            # train_instance = select_mask[:, 2]
+            # train_label = (train_instance > 0.3).float()
+            # # loss_physics = torch.pow(mask_pred_filter - select_mask[:, 2], 2).mean()
+            # loss_physics = (((-mask_label) * (train_instance + 1e-5).log() - (1 - mask_label) * (1 - train_instance + 1e-5).log())).mean()
+            # loss_physics = ((-train_label) * (mask_pred_filter + 1e-5).log() - (1 - train_label) * (1 - mask_pred_filter + 1e-5).log()).mean() + loss_physics
+            self.loss_physics = loss_physics * 10
+
+
         self.b = torch.cat(b, dim=1)
         self.m = torch.cat(m, dim=1)
         self.m_tilde_logits = torch.cat(m_tilde_logits, dim=1)
@@ -169,6 +274,9 @@ class MONetModel(BaseModel):
         self.loss_D = -torch.logsumexp(self.b, dim=1).sum() / n
         self.loss_mask = self.criterionKL(self.m_tilde_logits.log_softmax(dim=1), self.m)
         loss = self.loss_D + self.opt.beta * self.loss_E + self.opt.gamma * self.loss_mask
+
+        if self.opt.physics_loss:
+            loss = loss + self.loss_physics
 
         if self.opt.refine_motion:
             decode_objs = self.decode_objs
@@ -182,8 +290,9 @@ class MONetModel(BaseModel):
                 overlap_val = (seg_im[:, None, :] * decode_objs.exp()).sum(dim=[2, 3])
                 select_idx = torch.argmax(overlap_val, dim=1)
                 select_obj = torch.gather(decode_objs, 1, select_idx[:, None, None, None].repeat(1, 1, s[1], s[2]))
-                bce_loss = (-seg_im * select_obj + (1 - seg_im) * select_obj).mean()
-                loss = loss + 0.1 * bce_loss
+                bce_loss = (-seg_im * (select_obj + 1e-5) + -(1 - seg_im) * torch.log(1 - select_obj.exp() + 1e-5)).mean()
+                self.loss_bce = bce_loss
+                loss = loss + 10 * bce_loss
         loss.backward()
 
     def optimize_parameters(self):

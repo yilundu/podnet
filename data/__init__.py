@@ -15,6 +15,7 @@ import torch.utils.data
 from data.base_dataset import BaseDataset
 from data.intphys_dataset import IntPhysDataset
 from data.robotnet_dataset import RobotNetDataset
+from data.block_dataset import BlockDataset
 
 
 def find_dataset_using_name(dataset_name):
@@ -74,7 +75,11 @@ class CustomDatasetDataLoader():
         Step 2: create a multi-threaded data loader.
         """
         self.opt = opt
-        self.dataset = IntPhysDataset(opt)
+        if opt.dataset_mode == "block":
+            self.dataset = BlockDataset(opt)
+        else:
+            self.dataset = IntPhysDataset(opt)
+
         print("dataset [%s] was created" % type(self.dataset).__name__)
         self.dataloader = torch.utils.data.DataLoader(
             self.dataset,
