@@ -14,7 +14,8 @@ import importlib
 import torch.utils.data
 from data.base_dataset import BaseDataset
 from data.intphys_dataset import IntPhysDataset
-from data.robotnet_dataset import RobotNetDataset
+from data.intphysreal_dataset import IntPhysRealDataset
+# from data.robotnet_dataset import RobotNetDataset
 from data.block_dataset import BlockDataset
 
 
@@ -43,8 +44,11 @@ def find_dataset_using_name(dataset_name):
 
 def get_option_setter(dataset_name):
     """Return the static method <modify_commandline_options> of the dataset class."""
-    dataset_class = find_dataset_using_name(dataset_name)
-    return dataset_class.modify_commandline_options
+    try:
+        dataset_class = find_dataset_using_name(dataset_name)
+        return dataset_class.modify_commandline_options
+    except:
+        return lambda x, y: x
 
 
 def create_dataset(opt):
@@ -77,6 +81,8 @@ class CustomDatasetDataLoader():
         self.opt = opt
         if opt.dataset_mode == "block":
             self.dataset = BlockDataset(opt)
+        elif opt.dataset_mode == "intphysreal":
+            self.dataset = IntPhysRealDataset(opt)
         else:
             self.dataset = IntPhysDataset(opt)
 

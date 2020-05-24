@@ -38,6 +38,15 @@ class TrainOptions(BaseOptions):
         parser.add_argument('--refine_motion', action='store_true', help='use motion queues as additional supervision for training masks')
         parser.add_argument('--depth', action='store_true', help='add_depth')
         parser.add_argument('--physics_loss', action='store_true', help='add_depth')
+        parser.add_argument('--full_robonet', action='store_true', help='whether to evaluate on the full robonet')
+        parser.add_argument('--eval_intphys', action='store_true', help='evaluate intphys by loading segmentation maps')
+        parser.add_argument('--intphys_multicolor', action='store_true', help='evaluate with multiple colors of objects')
+        parser.add_argument('--no_multiscale_baseline', action='store_true', help='run baseline without multiscale')
+        parser.add_argument('--eval_cube', action='store_true', help='evaluate cube segmentation')
+        parser.add_argument('--optical_flow', action='store_true', help='generate data with optical flow as an additional channel')
+        parser.add_argument('--monet_baseline', action='store_true', help='run the old MONet architecture on the problem')
+        parser.add_argument('--human', action='store_true', help='run using the human split of ADEPT')
+        parser.add_argument('--eval_intersection', action='store_true', help='evaluate intersection of labels')
 
         self.isTrain = True
         return parser

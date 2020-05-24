@@ -649,8 +649,8 @@ class ComponentVAE(nn.Module):
         self.decode = nn.Conv2d(z_dim + 2, 8*ngf, kernel_size=3, padding=1)
         self.res1_upsample = BasicBlock(8*ngf, 4*ngf, remap=conv3x3_upsample(8*ngf, 4*ngf), upsample=True)
         self.res2_upsample = BasicBlock(4*ngf, 2*ngf, remap=conv3x3_upsample(4*ngf, 2*ngf), upsample=True)
-        self.res3_upsample = BasicBlock(2*ngf, ngf, remap=conv3x3_upsample(2*ngf, ngf), upsample=True)
-        self.res4_upsample = BasicBlock(ngf, ngf, remap=conv3x3_upsample(ngf, ngf), upsample=True)
+        # self.res3_upsample = BasicBlock(2*ngf, ngf, remap=conv3x3_upsample(2*ngf, ngf), upsample=True)
+        # self.res4_upsample = BasicBlock(ngf, ngf, remap=conv3x3_upsample(ngf, ngf), upsample=True)
         self.res5_upsample = BasicBlock(ngf, ngf, remap=conv3x3_upsample(ngf, ngf), upsample=True)
         self.output = nn.Conv2d(ngf, input_nc * frames + frames, 1)
         self._bg_logvar = 2 * torch.tensor(0.07).log()
@@ -738,8 +738,8 @@ class ComponentVAE(nn.Module):
         z_sb = F.relu(self.decode(z_sb))
         z_sb = self.res1_upsample(z_sb)
         z_sb = self.res2_upsample(z_sb)
-        z_sb = self.res3_upsample(z_sb)
-        z_sb = self.res4_upsample(z_sb)
+        # z_sb = self.res3_upsample(z_sb)
+        # z_sb = self.res4_upsample(z_sb)
         z_sb = self.res5_upsample(z_sb)
         output = self.output(z_sb)
         x_mu = output[:, :self._input_nc * self.frames]
@@ -760,6 +760,96 @@ class ComponentVAE(nn.Module):
         # x_mu = output[:, :self._input_nc * self.frames]
         # x_logvar = self._bg_logvar if background else self._fg_logvar
         # m_logits = output[:, self._input_nc * self.frames:]
+
+        return m_logits, x_mu, x_logvar, z_mu, z_logvar
+
+
+class ComponentVAEOld(nn.Module):
+
+    def __init__(self, input_nc, z_dim=16, full_res=False, frames=1):
+        super().__init__()
+        self._input_nc = input_nc
+        self._z_dim = z_dim
+        self.frames = frames
+
+        full_res = False # full res: 128x128, low res: 64x64
+        h_dim = 4096 if full_res else 1024
+        self.encoder = nn.Sequential(
+            nn.Conv2d(input_nc * frames + frames, 32, 3, stride=2, padding=1),
+            nn.ReLU(True),
+            nn.Conv2d(32, 32, 3, stride=2, padding=1),
+            nn.ReLU(True),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),
+            nn.ReLU(True),
+            nn.Conv2d(64, 64, 3, stride=2, padding=1),
+            nn.ReLU(True),
+            nn.Conv2d(64, 64, 3, stride=2, padding=1),
+            nn.ReLU(True),
+            nn.Conv2d(64, 64, 3, stride=2, padding=1),
+            nn.ReLU(True),
+            Flatten(),
+            nn.Linear(h_dim, 256),
+            nn.ReLU(True),
+            nn.Linear(256, 2 * z_dim)
+        )
+        self.decoder = nn.Sequential(
+            nn.Conv2d(z_dim + 2, 32, 3),
+            nn.ReLU(True),
+            nn.Conv2d(32, 32, 3),
+            nn.ReLU(True),
+            nn.Conv2d(32, 32, 3),
+            nn.ReLU(True),
+            nn.Conv2d(32, 32, 3),
+            nn.ReLU(True),
+            nn.Conv2d(32, input_nc * frames + frames, 1),
+        )
+        self._bg_logvar = 2 * torch.tensor(0.09).log()
+        self._fg_logvar = 2 * torch.tensor(0.11).log()
+        self.frames = frames
+
+    @staticmethod
+    def reparameterize(mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(mu)
+        return mu + eps * std
+
+    @staticmethod
+    def spatial_broadcast(z, h, w):
+        # Batch size
+        n = z.shape[0]
+        # Expand spatially: (n, z_dim) -> (n, z_dim, h, w)
+        z_b = z.view((n, -1, 1, 1)).expand(-1, -1, h, w)
+        # Coordinate axes:
+        x = torch.linspace(-1, 1, w, device=z.device)
+        y = torch.linspace(-1, 1, h, device=z.device)
+        y_b, x_b = torch.meshgrid(y, x)
+        # Expand from (h, w) -> (n, 1, h, w)
+        x_b = x_b.expand(n, 1, -1, -1)
+        y_b = y_b.expand(n, 1, -1, -1)
+        # Concatenate along the channel dimension: final shape = (n, z_dim + 2, h, w)
+        z_sb = torch.cat((z_b, x_b, y_b), dim=1)
+        return z_sb
+
+    def forward(self, x, log_m_k, background=False):
+        """
+        :param x: Input image
+        :param log_m_k: Attention mask logits
+        :return: x_k and reconstructed mask logits
+        """
+        params = self.encoder(torch.cat((x, log_m_k), dim=1))
+        z_mu = params[:, :self._z_dim]
+        z_logvar = params[:, self._z_dim:]
+        z = self.reparameterize(z_mu, z_logvar)
+
+        # "The height and width of the input to this CNN were both 8 larger than the target output (i.e. image) size
+        #  to arrive at the target size (i.e. accommodating for the lack of padding)."
+        h, w = x.shape[-2:]
+        z_sb = self.spatial_broadcast(z, h + 8, w + 8)
+
+        output = self.decoder(z_sb)
+        x_mu = output[:, :self._input_nc * self.frames]
+        x_logvar = self._bg_logvar if background else self._fg_logvar
+        m_logits = output[:, self._input_nc * self.frames:]
 
         return m_logits, x_mu, x_logvar, z_mu, z_logvar
 
@@ -859,9 +949,9 @@ class Attention(nn.Module):
 
         # Upsample
         self.res1_upsample = BasicBlock(8*ngf, 4*ngf, remap=conv3x3_upsample(8*ngf, 4*ngf), upsample=True)
-        self.res2_upsample = BasicBlock(4*ngf, 2*ngf, remap=conv3x3_upsample(4*ngf, 2*ngf), upsample=True)
-        self.res3_upsample = BasicBlock(2*ngf, ngf, remap=conv3x3_upsample(2*ngf, ngf), upsample=True)
-        self.res4_upsample = BasicBlock(ngf, ngf, remap=conv3x3_upsample(ngf, ngf), upsample=True)
+        self.res2_upsample = BasicBlock(4*ngf, ngf, remap=conv3x3_upsample(4*ngf, 2*ngf), upsample=True)
+        # self.res3_upsample = BasicBlock(2*ngf, ngf, remap=conv3x3_upsample(2*ngf, ngf), upsample=True)
+        # self.res4_upsample = BasicBlock(ngf, ngf, remap=conv3x3_upsample(ngf, ngf), upsample=True)
         self.res5_upsample = BasicBlock(ngf, ngf, remap=conv3x3_upsample(ngf, ngf), upsample=True)
         self.output = nn.Conv2d(ngf, output_nc, 1)
 
@@ -909,8 +999,8 @@ class Attention(nn.Module):
         x = self.res3(x)
         x = self.res1_upsample(x)
         x = self.res2_upsample(x)
-        x = self.res3_upsample(x)
-        x = self.res4_upsample(x)
+        # x = self.res3_upsample(x)
+        # x = self.res4_upsample(x)
         x = self.res5_upsample(x)
         x = self.output(x)
         x = F.logsigmoid(x)
@@ -943,4 +1033,86 @@ class Attention(nn.Module):
         # Output layer
         # x = self.output(x)
         # x = F.logsigmoid(x)
+        return x
+
+
+class AttentionOld(nn.Module):
+    """Create a Unet-based generator"""
+
+    def __init__(self, input_nc, output_nc, ngf=64):
+        """Construct a Unet generator
+        Parameters:
+            input_nc (int)  -- the number of channels in input images
+            output_nc (int) -- the number of channels in output images
+            num_downs (int) -- the number of downsamplings in UNet. For example, # if |num_downs| == 7,
+                                image of size 128x128 will become of size 1x1 # at the bottleneck
+            ngf (int)       -- the number of filters in the last conv layer
+
+        We construct the U-Net from the innermost layer to the outermost layer.
+        It is a recursive process.
+        """
+        super(AttentionOld, self).__init__()
+        # Old attention network
+        self.downblock1 = AttentionBlock(input_nc + output_nc, ngf)
+        self.downblock2 = AttentionBlock(ngf, ngf * 2)
+        self.downblock3 = AttentionBlock(ngf * 2, ngf * 4)
+        self.downblock4 = AttentionBlock(ngf * 4, ngf * 4)
+        self.downblock5 = AttentionBlock(ngf * 4, ngf * 4)
+        self.downblock6 = AttentionBlock(ngf * 4, ngf * 4)
+        self.downblock7 = AttentionBlock(ngf * 4, ngf * 4)
+        # no resizing occurs in the last block of each path
+        # self.downblock6 = AttentionBlock(ngf * 8, ngf * 8, resize=False)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(4 * 4 * ngf * 4, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 4 * 4 * ngf * 4),
+            nn.ReLU(),
+        )
+
+        # self.upblock1 = AttentionBlock(2 * ngf * 8, ngf * 8)
+        self.upblock2 = AttentionBlock(2 * ngf * 4, ngf * 4)
+        self.upblock3 = AttentionBlock(2 * ngf * 4, ngf * 4)
+        self.upblock4 = AttentionBlock(2 * ngf * 4, ngf * 4)
+
+        self.upblock5 = AttentionBlock(2 * ngf * 4, ngf * 4)
+        self.upblock6 = AttentionBlock(2 * ngf * 4, ngf * 2)
+        self.upblock7 = AttentionBlock(2 * ngf * 2, ngf)
+        # no resizing occurs in the last block of each path
+        self.upblock8 = AttentionBlock(2 * ngf, ngf, resize=False)
+        self.output = nn.Conv2d(ngf, output_nc, 1)
+
+
+    def forward(self, x, log_s_k):
+
+        # Old code
+        # Downsampling blocks
+        x, skip1 = self.downblock1(torch.cat((x, log_s_k), dim=1))
+        x, skip2 = self.downblock2(x)
+        x, skip3 = self.downblock3(x)
+        x, skip4 = self.downblock4(x)
+        x, skip5 = self.downblock5(x)
+        x, skip6 = self.downblock6(x)
+        x, skip7 = self.downblock7(x)
+        # The input to the MLP is the last skip tensor collected from the downsampling path (after flattening)
+        # _, skip6 = self.downblock6(x)
+        # Flatten
+        x = skip7.flatten(start_dim=1)
+        x = self.mlp(x)
+        # Reshape to match shape of last skip tensor
+        x = x.view(skip7.shape)
+        # Upsampling blocks
+        # x = self.upblock1(x, skip6)
+        x = self.upblock2(x, skip7)
+        x = self.upblock3(x, skip6)
+        x = self.upblock4(x, skip5)
+        x = self.upblock5(x, skip4)
+        x = self.upblock6(x, skip3)
+        x = self.upblock7(x, skip2)
+        x = self.upblock8(x, skip1)
+        # Output layer
+        x = self.output(x)
+        x = F.logsigmoid(x)
         return x

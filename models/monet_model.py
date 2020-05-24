@@ -27,7 +27,7 @@ class MONetModel(BaseModel):
         """
         parser.set_defaults(batch_size=64, lr=1e-4, display_ncols=7, niter_decay=0,
                             dataset_mode='clevr', niter=int(64e6 // 7e4))
-        parser.add_argument('--num_slots', metavar='K', type=int, default=4, help='Number of supported slots')
+        parser.add_argument('--num_slots', metavar='K', type=int, default=5, help='Number of supported slots')
         parser.add_argument('--frames', type=int, default=1, help='Number of frames to stack together as input')
         parser.add_argument('--z_dim', type=int, default=16, help='Dimension of individual z latent per slot')
         if is_train:
@@ -48,6 +48,8 @@ class MONetModel(BaseModel):
         BaseModel.__init__(self, opt)  # call the initialization method of BaseModel
         if opt.depth:
             opt.input_nc = 4
+        if opt.optical_flow:
+            opt.input_nc = 5
 
         self.loss_names = ['E', 'D', 'mask']
 
@@ -56,10 +58,9 @@ class MONetModel(BaseModel):
 
         if opt.physics_loss:
             self.loss_names.append('physics')
-            # self.loss_names.append('prim_constant')
+            self.loss_names.append('prim_next')
 
         self.opt = opt
-        self.opt.num_slots = 5
         self.visual_names = [['{}m{}'.format(j, i) for i in range(opt.num_slots)] + \
                             ['{}x{}'.format(j, i) for i in range(opt.num_slots)] + \
                             ['{}xm{}'.format(j, i) for i in range(opt.num_slots)] + \
@@ -68,9 +69,21 @@ class MONetModel(BaseModel):
         self.visual_names = sum(self.visual_names, [])
         print(self.visual_names)
         self.model_names = ['Attn', 'CVAE']
-        self.netAttn = networks.init_net(networks.Attention(opt.input_nc * opt.frames, opt.frames, ngf=2*opt.z_dim), gpu_ids=self.gpu_ids)
-        self.netCVAE = networks.init_net(networks.ComponentVAE(opt.input_nc, opt.z_dim, frames=opt.frames), gpu_ids=self.gpu_ids)
-        snapshot = torch.load("/data/vision/billf/scratch/yilundu/adept/adept_seg3d/cachedir/smoketest/model_43000")
+
+        if self.opt.monet_baseline:
+            self.netAttn = networks.init_net(networks.AttentionOld(opt.input_nc * opt.frames, opt.frames, ngf=2*opt.z_dim), gpu_ids=self.gpu_ids)
+            self.netCVAE = networks.init_net(networks.ComponentVAEOld(opt.input_nc, opt.z_dim, frames=opt.frames), gpu_ids=self.gpu_ids)
+        else:
+            self.netAttn = networks.init_net(networks.Attention(opt.input_nc * opt.frames, opt.frames, ngf=2*opt.z_dim), gpu_ids=self.gpu_ids)
+            self.netCVAE = networks.init_net(networks.ComponentVAE(opt.input_nc, opt.z_dim, frames=opt.frames), gpu_ids=self.gpu_ids)
+        # snapshot = torch.load("/data/vision/billf/scratch/yilundu/adept/adept_seg3d/cachedir/smoketest/model_43000")
+        if opt.dataset_mode == "block":
+            snapshot = torch.load("/data/vision/billf/scratch/yilundu/adept/adept_seg3d/cachedir//block_129/model_10000")
+        else:
+            # Shapenet objects
+            snapshot = torch.load("/data/vision/billf/scratch/yilundu/adept/adept_seg3d/cachedir/seg_mask_again_126/model_35000")
+            # Only blocks
+            # snapshot = torch.load("/data/vision/billf/scratch/yilundu/adept/adept_seg3d/cachedir/smoketest/model_43000")
         self.mask2prim = Mask2Cube()
         self.prim2mask = Cube2Mask()
         self.mask2prim.load_state_dict(snapshot['mask2cube_state_dict'])
@@ -123,70 +136,85 @@ class MONetModel(BaseModel):
 
         decode_objs = []
 
-        for k in range(self.opt.num_slots):
-            # Derive mask from current scope
-            if k != self.opt.num_slots - 1:
-                log_alpha_k = self.netAttn(self.x, log_s_k)
-                log_m_k = log_s_k + log_alpha_k
-                # Compute next scope
-                log_s_k += (1. - log_alpha_k.exp()).clamp(min=self.eps).log()
-            else:
-                log_m_k = log_s_k
+        if self.opt.full_robonet or self.opt.eval_intphys or self.opt.eval_cube:
+            context = torch.no_grad
+        else:
+            context = torch.enable_grad
 
-            if k != 0 and k != self.opt.num_slots - 1:
-                decode_objs.append(log_m_k)
-
-            # Get component and mask reconstruction, as well as the z_k parameters
-            m_tilde_k_logits, x_mu_k, x_logvar_k, z_mu_k, z_logvar_k = self.netCVAE(self.x, log_m_k, k == 0)
-
-            # KLD is additive for independent distributions
-            self.loss_E += -0.5 * (1 + z_logvar_k - z_mu_k.pow(2) - z_logvar_k.exp()).sum()
-
-            m_k = log_m_k.exp()
-
-            if self.opt.frames > 1:
-                s = x_mu_k.size()
-                x_mu_k_expand = x_mu_k.view(s[0], self.opt.frames, 3, *s[2:])
-                x_k_masked = x_mu_k_expand * m_k[:, :, None, :, :]
-                x_k_masked = x_k_masked.view(*s)
-            else:
-                x_k_masked = m_k * x_mu_k
+        with context():
+            for k in range(self.opt.num_slots):
+                # Derive mask from current scope
+                if k != self.opt.num_slots - 1:
+                    log_alpha_k = self.netAttn(self.x, log_s_k)
+                    log_m_k = log_s_k + log_alpha_k
+                    # Compute next scope
+                    log_s_k += (1. - log_alpha_k.exp()).clamp(min=self.eps).log()
+                else:
+                    log_m_k = log_s_k
 
 
-            # Exponents for the decoder loss
-            if self.opt.frames > 1:
-                s = log_m_k.size()
-                log_m_k = log_m_k[:, :, None, :, :].repeat(1, 1, 3, 1, 1)
-                log_m_k = log_m_k.view(s[0], self.opt.frames * 3, *s[2:])
-                b_k = log_m_k - 0.5 * x_logvar_k - (self.x - x_mu_k).pow(2) / (2 * x_logvar_k.exp())
-            else:
-                b_k = log_m_k - 0.5 * x_logvar_k - (self.x - x_mu_k).pow(2) / (2 * x_logvar_k.exp())
-            b.append(b_k.unsqueeze(1))
+                # Get component and mask reconstruction, as well as the z_k parameters
+                m_tilde_k_logits, x_mu_k, x_logvar_k, z_mu_k, z_logvar_k = self.netCVAE(self.x, log_m_k, k == 0)
 
-            # Get outputs for kth step
+                if self.opt.dataset_mode == "block":
+                    if k != 0:
+                        decode_objs.append(m_tilde_k_logits)
+                elif k != 0 and k != self.opt.num_slots - 1:
+                    decode_objs.append(m_tilde_k_logits)
 
-            # Iteratively reconstruct the output image
-            self.x_tilde += x_k_masked
+                # KLD is additive for independent distributions
+                self.loss_E += -0.5 * (1 + z_logvar_k - z_mu_k.pow(2) - z_logvar_k.exp()).sum()
 
-            for i in range(self.opt.frames):
-                setattr(self, '{}m{}'.format(i, k), m_k[:, i:i+1] * 2. - 1.) # shift mask from [0, 1] to [-1, 1]
-                setattr(self, '{}x{}'.format(i, k), x_mu_k[:, 3*i:3*(i+1)])
-                setattr(self, '{}xm{}'.format(i, k), x_k_masked[:, 3*i:3*(i+1)])
-                setattr(self, '{}x_tilde'.format(i), self.x_tilde[:, 3*i:3*(i+1)])
-                setattr(self, '{}x'.format(i), self.x[:, 3*i:3*(i+1)])
+                m_k = log_m_k.exp()
 
-            # Accumulate
-            m.append(m_k)
-            m_tilde_logits.append(m_tilde_k_logits)
+                if self.opt.frames > 1:
+                    s = x_mu_k.size()
+                    x_mu_k_expand = x_mu_k.view(s[0], self.opt.frames, 3, *s[2:])
+                    x_k_masked = x_mu_k_expand * m_k[:, :, None, :, :]
+                    x_k_masked = x_k_masked.view(*s)
+                else:
+                    x_k_masked = m_k * x_mu_k
 
-        self.decode_objs = torch.cat(decode_objs, dim=1)
+
+                # Exponents for the decoder loss
+                if self.opt.frames > 1:
+                    s = log_m_k.size()
+                    log_m_k = log_m_k[:, :, None, :, :].repeat(1, 1, 3, 1, 1)
+                    log_m_k = log_m_k.view(s[0], self.opt.frames * 3, *s[2:])
+                    b_k = log_m_k - 0.5 * x_logvar_k - (self.x - x_mu_k).pow(2) / (2 * x_logvar_k.exp())
+                else:
+                    b_k = log_m_k - 0.5 * x_logvar_k - (self.x - x_mu_k).pow(2) / (2 * x_logvar_k.exp())
+                b.append(b_k.unsqueeze(1))
+
+                # Get outputs for kth step
+
+                # Iteratively reconstruct the output image
+                self.x_tilde += x_k_masked
+
+                for i in range(self.opt.frames):
+                    setattr(self, '{}m{}'.format(i, k), m_k[:, i:i+1] * 2. - 1.) # shift mask from [0, 1] to [-1, 1]
+                    setattr(self, '{}x{}'.format(i, k), x_mu_k[:, 3*i:3*(i+1)])
+                    setattr(self, '{}xm{}'.format(i, k), x_k_masked[:, 3*i:3*(i+1)])
+                    setattr(self, '{}x_tilde'.format(i), self.x_tilde[:, 3*i:3*(i+1)])
+                    setattr(self, '{}x'.format(i), self.x[:, 3*i:3*(i+1)])
+
+                # Accumulate
+                m.append(m_k)
+                m_tilde_logits.append(m_tilde_k_logits)
+
+            self.decode_objs = torch.cat(decode_objs, dim=1)
 
         if self.opt.physics_loss:
             masks = self.decode_objs.exp()
             select_mask = masks
 
+            if self.opt.dataset_mode == "block":
+                null_tresh = 300
+            else:
+                null_tresh = 50
+
             # For now let's use the threshold pixel of 50
-            mask_valid = select_mask.sum(dim=[2, 3]) > 50
+            mask_valid = select_mask.sum(dim=[2, 3]) > null_tresh
             s = mask_valid.size()
             sm = select_mask.size()
             select_mask = select_mask.view(sm[0]*sm[1], 1, sm[2], sm[3])
@@ -194,14 +222,14 @@ class MONetModel(BaseModel):
             prim = self.mask2prim(select_mask)
             prim = prim.view(-1, 3, s[1], 7)
 
-            # loss_prim_constant = torch.pow(prim[:, :, :, 2:] - prim[:, :, :, 2:].mean(dim=1, keepdim=True), 2).mean()
-            # self.loss_prim_constant = 10 * loss_prim_constant
 
-            # prim_diff_pos = prim[:, 1, :2] - prim[:, 0, :2]
-            # prim_next = torch.cat([prim[:, 1, :2] + prim_diff_pos, (prim[:, 1, 2:] + prim[:, 0, 2:]) / 2.], dim=1)
-            prim_next = prim[:, 1].contiguous() + (prim[:, 1] - prim[:, 0])
+            prim_diff_pos = prim[:, 1, :3] - prim[:, 0, :3]
+            prim_next = torch.cat([prim[:, 1, :3] + prim_diff_pos, (prim[:, 1, 3:5] + prim[:, 0, 3:5]) / 2., 2 * prim[:, 1, 5:] - prim[:, 0, 5:]], dim=1)
+            # prim_next = prim[:, 1].contiguous()
 
             s = prim_next.size()
+
+            loss_prim_next = torch.pow(prim_next - prim[:, 2], 2).mean()
             prim_next = prim_next.view(-1, 7)
 
             mask_pred = self.prim2mask(prim_next)
@@ -223,22 +251,31 @@ class MONetModel(BaseModel):
             # 6 x 3
             # mask_valid is also size
             # 6 x 3
-            # for i in range(dist_idx.size(0)):
-            #     for j in range(dist_idx.size(1)):
-            #     # Could probably try to parallelize this operation
-            #         select_idx = dist_idx[i, j]
-            #         valid_mask = (mask_pred_total[i, 0] < 0.4).float()
-            #         mask_pred_filter[i, select_idx] = mask_pred[i, select_idx] * valid_mask * mask_valid[i, select_idx]
-            #         mask_pred_total[i, 0] = mask_pred_total[i, 0] + mask_pred[i, select_idx] * mask_valid[i, select_idx] * valid_mask
+            for i in range(dist_idx.size(0)):
+                for j in range(dist_idx.size(1)):
+                # Could probably try to parallelize this operation
+                    select_idx = dist_idx[i, j]
+                    valid_mask = (mask_pred_total[i, 0] < 0.4).float()
+                    mask_pred_filter[i, select_idx] = mask_pred[i, select_idx] * valid_mask * mask_valid[i, select_idx]
+                    mask_pred_total[i, 0] = mask_pred_total[i, 0] + mask_pred[i, select_idx] * mask_valid[i, select_idx] * valid_mask
 
             # Some code for debugging values
             # init_image = select_mask.detach().cpu().numpy()
             # s = init_image.shape
+            # import pdb
+            # pdb.set_trace()
             # init_image = init_image.reshape((s[2] * s[0] * s[1], s[3]))
             # imwrite("init_im.png", init_image)
 
+            if self.opt.dataset_mode == "block":
+                mask_tresh = 0.4
+                mask_tresh_other = 0.4
+            else:
+                mask_tresh = 0.8
+                mask_tresh_other = 0.2
+
             # select_mask_im = select_mask[:, :, :, 0].detach().cpu().numpy()
-            # mask_pred_filter_im = mask_pred_filter[:, :, 0].detach().cpu().numpy()
+            # mask_pred_filter_im = (mask_pred_filter[:, :, 0] > mask_tresh).detach().cpu().numpy()
 
             # for i in range(select_mask_im.shape[0]):
             #     select_mask_im_i = select_mask_im[i]
@@ -254,13 +291,24 @@ class MONetModel(BaseModel):
             #     assert False
 
             # Make the masks the same
-            # mask_label = (mask_pred_filter > 0.3).float()
-            # train_instance = select_mask[:, 2]
-            # train_label = (train_instance > 0.3).float()
-            # # loss_physics = torch.pow(mask_pred_filter - select_mask[:, 2], 2).mean()
-            # loss_physics = (((-mask_label) * (train_instance + 1e-5).log() - (1 - mask_label) * (1 - train_instance + 1e-5).log())).mean()
-            # loss_physics = ((-train_label) * (mask_pred_filter + 1e-5).log() - (1 - train_label) * (1 - mask_pred_filter + 1e-5).log()).mean() + loss_physics
-            self.loss_physics = loss_physics * 10
+            mask_label = (mask_pred_filter > mask_tresh).float()
+            train_instance = select_mask[:, 2]
+            train_label = (train_instance > mask_tresh_other).float()
+            # loss_physics = torch.pow(mask_pred_filter - select_mask[:, 2], 2).mean()
+            loss_physics = (((-mask_label) * (train_instance + 1e-5).log() - (1 - mask_label) * (1 - train_instance + 1e-5).log())).mean()
+            loss_physics = ((-train_label) * (mask_pred_filter + 1e-5).log() - (1 - train_label) * (1 - mask_pred_filter + 1e-5).log()).mean() + loss_physics
+
+            # This is the solution for adept
+            # self.loss_physics = loss_physics * 100.0
+            # self.loss_prim_next = loss_prim_next * 1.0
+
+            # This is the solution for blocks
+            # self.loss_physics = loss_physics * 10.0
+            # self.loss_prim_next = loss_prim_next * 10.0
+
+            # Else
+            self.loss_physics = loss_physics * 100.0
+            self.loss_prim_next = loss_prim_next * 1.0
 
 
         self.b = torch.cat(b, dim=1)
@@ -276,7 +324,7 @@ class MONetModel(BaseModel):
         loss = self.loss_D + self.opt.beta * self.loss_E + self.opt.gamma * self.loss_mask
 
         if self.opt.physics_loss:
-            loss = loss + self.loss_physics
+            loss = loss + self.loss_physics + self.loss_prim_next
 
         if self.opt.refine_motion:
             decode_objs = self.decode_objs
