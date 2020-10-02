@@ -158,14 +158,17 @@ class MONetModel(BaseModel):
 
                 if self.opt.dataset_mode == "block":
                     if k != 0:
-                        decode_objs.append(m_tilde_k_logits)
+                        decode_objs.append(log_m_k)
                 elif k != 0 and k != self.opt.num_slots - 1:
-                    decode_objs.append(m_tilde_k_logits)
+                    decode_objs.append(log_m_k)
 
                 # KLD is additive for independent distributions
                 self.loss_E += -0.5 * (1 + z_logvar_k - z_mu_k.pow(2) - z_logvar_k.exp()).sum()
 
-                m_k = log_m_k.exp()
+                if self.opt.optical_flow:
+                    m_k = (log_m_k).exp()
+                else:
+                    m_k = log_m_k.exp()
 
                 if self.opt.frames > 1:
                     s = x_mu_k.size()
@@ -309,7 +312,6 @@ class MONetModel(BaseModel):
             # Else
             self.loss_physics = loss_physics * 100.0
             self.loss_prim_next = loss_prim_next * 1.0
-
 
         self.b = torch.cat(b, dim=1)
         self.m = torch.cat(m, dim=1)

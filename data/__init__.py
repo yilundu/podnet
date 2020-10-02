@@ -17,6 +17,7 @@ from data.intphys_dataset import IntPhysDataset
 from data.intphysreal_dataset import IntPhysRealDataset
 # from data.robotnet_dataset import RobotNetDataset
 from data.block_dataset import BlockDataset
+from data.cube_dataset import CubeDataset
 
 
 def find_dataset_using_name(dataset_name):
@@ -69,6 +70,18 @@ def create_dataset(opt):
     return dataset
 
 
+def collate_custom(inp):
+    arr0, arr1, arr2, arr3 = zip(*inp)
+    arr0 = torch.stack(arr0, dim=0)
+    arr1 = torch.stack(arr1, dim=0)
+    arr2 = torch.stack(arr2, dim=0)
+    arr3_list = []
+
+    for ele in arr3:
+        arr3_list.extend(ele)
+
+    return arr0, arr1, arr2, arr3_list
+
 class CustomDatasetDataLoader():
     """Wrapper class of Dataset class that performs multi-threaded data loading"""
 
@@ -83,6 +96,8 @@ class CustomDatasetDataLoader():
             self.dataset = BlockDataset(opt)
         elif opt.dataset_mode == "intphysreal":
             self.dataset = IntPhysRealDataset(opt)
+        elif opt.dataset_mode == "cube":
+            self.dataset = CubeDataset(opt)
         else:
             self.dataset = IntPhysDataset(opt)
 
@@ -91,6 +106,7 @@ class CustomDatasetDataLoader():
             self.dataset,
             batch_size=opt.batch_size,
             shuffle=not opt.serial_batches,
+            collate_fn=collate_custom,
             num_workers=int(opt.num_threads))
 
     def load_data(self):
