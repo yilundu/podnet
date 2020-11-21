@@ -106,7 +106,7 @@ class CustomDatasetDataLoader():
             self.dataset,
             batch_size=opt.batch_size,
             shuffle=not opt.serial_batches,
-            collate_fn=collate_custom,
+            # collate_fn=collate_custom,
             num_workers=int(opt.num_threads))
 
     def load_data(self):

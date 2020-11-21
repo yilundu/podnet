@@ -6,7 +6,7 @@ from torch import nn, optim
 
 from .base_model import BaseModel
 from . import networks
-from .inverse_graphics import Mask2Cube, Cube2Mask
+from .inverse_graphics import Mask2Cube, Cube2Mask, Mask2CubeManual, Cube2MaskManual
 import os.path as osp
 from imageio import imwrite
 import numpy as np
@@ -29,6 +29,7 @@ class MONetModel(BaseModel):
                             dataset_mode='clevr', niter=int(64e6 // 7e4))
         parser.add_argument('--num_slots', metavar='K', type=int, default=5, help='Number of supported slots')
         parser.add_argument('--frames', type=int, default=1, help='Number of frames to stack together as input')
+        parser.add_argument('--manual', type=int, default=0, help='whether to use a manual mapping or not')
         parser.add_argument('--z_dim', type=int, default=16, help='Dimension of individual z latent per slot')
         if is_train:
             parser.add_argument('--beta', type=float, default=0.5, help='weight for the encoder KLD')
@@ -84,12 +85,19 @@ class MONetModel(BaseModel):
             snapshot = torch.load("/data/vision/billf/scratch/yilundu/adept/adept_seg3d/cachedir/seg_mask_again_126/model_35000")
             # Only blocks
             # snapshot = torch.load("/data/vision/billf/scratch/yilundu/adept/adept_seg3d/cachedir/smoketest/model_43000")
-        self.mask2prim = Mask2Cube()
-        self.prim2mask = Cube2Mask()
-        self.mask2prim.load_state_dict(snapshot['mask2cube_state_dict'])
-        self.prim2mask.load_state_dict(snapshot['cube2mask_state_dict'])
-        self.mask2prim = self.mask2prim.cuda().eval()
-        self.prim2mask = self.prim2mask.cuda().eval()
+
+        if opt.manual:
+            self.mask2prim = Mask2CubeManual()
+            self.prim2mask = Cube2MaskManual()
+            self.mask2prim = self.mask2prim.cuda().eval()
+            self.prim2mask = self.prim2mask.cuda().eval()
+        else:
+            self.mask2prim = Mask2Cube()
+            self.prim2mask = Cube2Mask()
+            self.mask2prim.load_state_dict(snapshot['mask2cube_state_dict'])
+            self.prim2mask.load_state_dict(snapshot['cube2mask_state_dict'])
+            self.mask2prim = self.mask2prim.cuda().eval()
+            self.prim2mask = self.prim2mask.cuda().eval()
         # The camera these models are trained at is positioned at (5.266, 0, 2.462)
         self.camera_pose = torch.Tensor([5.266, 0, 2.462]).to(self.device)
 
@@ -208,110 +216,240 @@ class MONetModel(BaseModel):
             self.decode_objs = torch.cat(decode_objs, dim=1)
 
         if self.opt.physics_loss:
-            masks = self.decode_objs.exp()
-            select_mask = masks
+            if self.opt.manual:
+                masks = self.decode_objs.exp()
+                select_mask = masks
 
-            if self.opt.dataset_mode == "block":
-                null_tresh = 300
+                if self.opt.dataset_mode == "block":
+                    null_tresh = 300
+                else:
+                    null_tresh = 50
+
+                # For now let's use the threshold pixel of 50
+                mask_valid = select_mask.sum(dim=[2, 3]) > null_tresh
+                s = mask_valid.size()
+                sm = select_mask.size()
+                select_mask = select_mask.view(sm[0]*sm[1], 1, sm[2], sm[3])
+
+                prim = self.mask2prim(select_mask)
+
+                # encode_mask = self.prim2mask(prim)
+                # from skimage.io import imsave
+                # select_mask_cpu = select_mask.detach().cpu().numpy()
+                # encode_mask_cpu = encode_mask.detach().cpu().numpy()
+                # for i in range(select_mask_cpu.shape[0]):
+                #     imsave("select_mask_{}.png".format(i), select_mask_cpu[i, 0])
+                #     imsave("encode_mask_{}.png".format(i), encode_mask_cpu[i, 0])
+                # import pdb
+                # pdb.set_trace()
+                prim = prim.view(-1, 3, s[1], 7)
+
+
+                prim_diff_pos = prim[:, 1, :3] - prim[:, 0, :3]
+                prim_next = torch.cat([prim[:, 1, :3] + prim_diff_pos, (prim[:, 1, 3:5] + prim[:, 0, 3:5]) / 2., 2 * prim[:, 1, 5:] - prim[:, 0, 5:]], dim=1)
+                # prim_next = prim[:, 1].contiguous()
+
+                s = prim_next.size()
+
+                loss_prim_next = torch.pow(prim_next - prim[:, 2], 2).mean()
+                prim_next = prim_next.view(-1, 7)
+
+                mask_pred = self.prim2mask(prim_next)
+                ms = mask_pred.size()
+                mask_pred = mask_pred.view(s[0], s[1], *ms[1:])
+                prim_next = prim_next.view(*s)
+
+                # Use the last state to infer the set of valid objects
+                mask_valid = mask_valid.view(-1, 3, s[1])[:, 1, :]
+                dist = torch.norm(prim_next[:, :, :3] - self.camera_pose[None, None, :], p=2, dim=2)
+
+                dist_idx = torch.argsort(dist, dim=1)
+                mask_pred_total = torch.zeros_like(mask_pred[:, 0:1])
+                mask_pred_total.requires_grad_(True)
+                mask_pred_filter = torch.zeros_like(mask_pred)
+                mask_pred_filter.requires_grad_(True)
+                select_mask = select_mask.view(-1, 3, sm[1], 1, sm[2], sm[3])
+                # Filter through each element of the predict mask based off distance to handle occlusions between objects
+
+                # dist_idx is size
+                # 6 x 3
+                # mask_valid is also size
+                # 6 x 3
+                for i in range(dist_idx.size(0)):
+                    for j in range(dist_idx.size(1)):
+                    # Could probably try to parallelize this operation
+                        select_idx = dist_idx[i, j]
+                        valid_mask = (mask_pred_total[i, 0] < 0.4).float()
+                        mask_pred_filter[i, select_idx] = mask_pred[i, select_idx] * valid_mask * mask_valid[i, select_idx]
+                        mask_pred_total[i, 0] = mask_pred_total[i, 0] + mask_pred[i, select_idx] * mask_valid[i, select_idx] * valid_mask
+
+                # Some code for debugging values
+                # init_image = select_mask.detach().cpu().numpy()
+                # s = init_image.shape
+                # import pdb
+                # pdb.set_trace()
+                # init_image = init_image.reshape((s[2] * s[0] * s[1], s[3]))
+                # imwrite("init_im.png", init_image)
+
+                if self.opt.dataset_mode == "block":
+                    mask_tresh = 0.4
+                    mask_tresh_other = 0.4
+                else:
+                    mask_tresh = 0.8
+                    mask_tresh_other = 0.2
+
+                # select_mask_im = select_mask[:, :, :, 0].detach().cpu().numpy()
+                # mask_pred_filter_im = (mask_pred_filter[:, :, 0] > mask_tresh).detach().cpu().numpy()
+
+                # for i in range(select_mask_im.shape[0]):
+                #     select_mask_im_i = select_mask_im[i]
+                #     mask_pred_filter_im_i = mask_pred_filter_im[i]
+                #     joint_im = np.concatenate([select_mask_im_i, mask_pred_filter_im_i[None, :]], axis=0)
+                #     joint_im = joint_im.transpose((0, 2, 1, 3))
+                #     s = joint_im.shape
+                #     joint_im = joint_im.reshape((s[0]*s[1], s[2]*s[3]))
+                #     imwrite(osp.join("masks", "joint_{}.png".format(self.counter)), joint_im)
+                #     self.counter += 1
+
+                # if self.counter == 50:
+                #     assert False
+
+                # Make the masks the same
+                mask_label = (mask_pred_filter > mask_tresh).float()
+                train_instance = select_mask[:, 2]
+                train_label = (train_instance > mask_tresh_other).float()
+                # loss_physics = torch.pow(mask_pred_filter - select_mask[:, 2], 2).mean()
+                loss_physics = (((-mask_label) * (train_instance + 1e-5).log() - (1 - mask_label) * (1 - train_instance + 1e-5).log())).mean()
+                # loss_physics = ((-train_label) * (mask_pred_filter + 1e-5).log() - (1 - train_label) * (1 - mask_pred_filter + 1e-5).log()).mean() + loss_physics
+
+                # This is the solution for adept
+                # self.loss_physics = loss_physics * 100.0
+                # self.loss_prim_next = loss_prim_next * 1.0
+
+                # This is the solution for blocks
+                # self.loss_physics = loss_physics * 10.0
+                # self.loss_prim_next = loss_prim_next * 10.0
+
+                # Else
+                self.loss_physics = loss_physics * 100.0
+                self.loss_prim_next = loss_prim_next * 1.0
             else:
-                null_tresh = 50
+                masks = self.decode_objs.exp()
+                select_mask = masks
 
-            # For now let's use the threshold pixel of 50
-            mask_valid = select_mask.sum(dim=[2, 3]) > null_tresh
-            s = mask_valid.size()
-            sm = select_mask.size()
-            select_mask = select_mask.view(sm[0]*sm[1], 1, sm[2], sm[3])
+                if self.opt.dataset_mode == "block":
+                    null_tresh = 300
+                else:
+                    null_tresh = 50
 
-            prim = self.mask2prim(select_mask)
-            prim = prim.view(-1, 3, s[1], 7)
+                # For now let's use the threshold pixel of 50
+                mask_valid = select_mask.sum(dim=[2, 3]) > null_tresh
+                s = mask_valid.size()
+                sm = select_mask.size()
+                select_mask = select_mask.view(sm[0]*sm[1], 1, sm[2], sm[3])
+
+                prim = self.mask2prim(select_mask)
+
+                # encode_mask = self.prim2mask(prim)
+                # from skimage.io import imsave
+                # select_mask_cpu = select_mask.detach().cpu().numpy()
+                # encode_mask_cpu = encode_mask.detach().cpu().numpy()
+                # for i in range(select_mask_cpu.shape[0]):
+                #     imsave("select_mask_{}.png".format(i), select_mask_cpu[i, 0])
+                #     imsave("encode_mask_{}.png".format(i), encode_mask_cpu[i, 0])
+                # import pdb
+                # pdb.set_trace()
+                prim = prim.view(-1, 3, s[1], 7)
 
 
-            prim_diff_pos = prim[:, 1, :3] - prim[:, 0, :3]
-            prim_next = torch.cat([prim[:, 1, :3] + prim_diff_pos, (prim[:, 1, 3:5] + prim[:, 0, 3:5]) / 2., 2 * prim[:, 1, 5:] - prim[:, 0, 5:]], dim=1)
-            # prim_next = prim[:, 1].contiguous()
+                prim_diff_pos = prim[:, 1, :3] - prim[:, 0, :3]
+                prim_next = torch.cat([prim[:, 1, :3] + prim_diff_pos, (prim[:, 1, 3:5] + prim[:, 0, 3:5]) / 2., 2 * prim[:, 1, 5:] - prim[:, 0, 5:]], dim=1)
+                # prim_next = prim[:, 1].contiguous()
 
-            s = prim_next.size()
+                s = prim_next.size()
 
-            loss_prim_next = torch.pow(prim_next - prim[:, 2], 2).mean()
-            prim_next = prim_next.view(-1, 7)
+                loss_prim_next = torch.pow(prim_next - prim[:, 2], 2).mean()
+                prim_next = prim_next.view(-1, 7)
 
-            mask_pred = self.prim2mask(prim_next)
-            ms = mask_pred.size()
-            mask_pred = mask_pred.view(s[0], s[1], *ms[1:])
-            prim_next = prim_next.view(*s)
+                mask_pred = self.prim2mask(prim_next)
+                ms = mask_pred.size()
+                mask_pred = mask_pred.view(s[0], s[1], *ms[1:])
+                prim_next = prim_next.view(*s)
 
-            # Use the last state to infer the set of valid objects
-            mask_valid = mask_valid.view(-1, 3, s[1])[:, 1, :]
-            dist = torch.norm(prim_next[:, :, :3] - self.camera_pose[None, None, :], p=2, dim=2)
+                # Use the last state to infer the set of valid objects
+                mask_valid = mask_valid.view(-1, 3, s[1])[:, 1, :]
+                dist = torch.norm(prim_next[:, :, :3] - self.camera_pose[None, None, :], p=2, dim=2)
 
-            dist_idx = torch.argsort(dist, dim=1)
-            mask_pred_total = torch.zeros_like(mask_pred[:, 0:1])
-            mask_pred_filter = torch.zeros_like(mask_pred)
-            select_mask = select_mask.view(-1, 3, sm[1], 1, sm[2], sm[3])
-            # Filter through each element of the predict mask based off distance to handle occlusions between objects
+                dist_idx = torch.argsort(dist, dim=1)
+                mask_pred_total = torch.zeros_like(mask_pred[:, 0:1])
+                mask_pred_total.requires_grad_(True)
+                mask_pred_filter = torch.zeros_like(mask_pred)
+                select_mask = select_mask.view(-1, 3, sm[1], 1, sm[2], sm[3])
+                mask_pred_filter.requires_grad_(True)
+                # Filter through each element of the predict mask based off distance to handle occlusions between objects
 
-            # dist_idx is size
-            # 6 x 3
-            # mask_valid is also size
-            # 6 x 3
-            for i in range(dist_idx.size(0)):
-                for j in range(dist_idx.size(1)):
-                # Could probably try to parallelize this operation
-                    select_idx = dist_idx[i, j]
-                    valid_mask = (mask_pred_total[i, 0] < 0.4).float()
-                    mask_pred_filter[i, select_idx] = mask_pred[i, select_idx] * valid_mask * mask_valid[i, select_idx]
-                    mask_pred_total[i, 0] = mask_pred_total[i, 0] + mask_pred[i, select_idx] * mask_valid[i, select_idx] * valid_mask
+                # dist_idx is size
+                # 6 x 3
+                # mask_valid is also size
+                # 6 x 3
+                for i in range(dist_idx.size(0)):
+                    for j in range(dist_idx.size(1)):
+                    # Could probably try to parallelize this operation
+                        select_idx = dist_idx[i, j]
+                        valid_mask = (mask_pred_total[i, 0] < 0.4).float()
+                        mask_pred_filter[i, select_idx] = mask_pred[i, select_idx] * valid_mask * mask_valid[i, select_idx]
+                        mask_pred_total[i, 0] = mask_pred_total[i, 0] + mask_pred[i, select_idx] * mask_valid[i, select_idx] * valid_mask
 
-            # Some code for debugging values
-            # init_image = select_mask.detach().cpu().numpy()
-            # s = init_image.shape
-            # import pdb
-            # pdb.set_trace()
-            # init_image = init_image.reshape((s[2] * s[0] * s[1], s[3]))
-            # imwrite("init_im.png", init_image)
+                # Some code for debugging values
+                # init_image = select_mask.detach().cpu().numpy()
+                # s = init_image.shape
+                # import pdb
+                # pdb.set_trace()
+                # init_image = init_image.reshape((s[2] * s[0] * s[1], s[3]))
+                # imwrite("init_im.png", init_image)
 
-            if self.opt.dataset_mode == "block":
-                mask_tresh = 0.4
-                mask_tresh_other = 0.4
-            else:
-                mask_tresh = 0.8
-                mask_tresh_other = 0.2
+                if self.opt.dataset_mode == "block":
+                    mask_tresh = 0.4
+                    mask_tresh_other = 0.4
+                else:
+                    mask_tresh = 0.8
+                    mask_tresh_other = 0.2
 
-            # select_mask_im = select_mask[:, :, :, 0].detach().cpu().numpy()
-            # mask_pred_filter_im = (mask_pred_filter[:, :, 0] > mask_tresh).detach().cpu().numpy()
+                # select_mask_im = select_mask[:, :, :, 0].detach().cpu().numpy()
+                # mask_pred_filter_im = (mask_pred_filter[:, :, 0] > mask_tresh).detach().cpu().numpy()
 
-            # for i in range(select_mask_im.shape[0]):
-            #     select_mask_im_i = select_mask_im[i]
-            #     mask_pred_filter_im_i = mask_pred_filter_im[i]
-            #     joint_im = np.concatenate([select_mask_im_i, mask_pred_filter_im_i[None, :]], axis=0)
-            #     joint_im = joint_im.transpose((0, 2, 1, 3))
-            #     s = joint_im.shape
-            #     joint_im = joint_im.reshape((s[0]*s[1], s[2]*s[3]))
-            #     imwrite(osp.join("masks", "joint_{}.png".format(self.counter)), joint_im)
-            #     self.counter += 1
+                # for i in range(select_mask_im.shape[0]):
+                #     select_mask_im_i = select_mask_im[i]
+                #     mask_pred_filter_im_i = mask_pred_filter_im[i]
+                #     joint_im = np.concatenate([select_mask_im_i, mask_pred_filter_im_i[None, :]], axis=0)
+                #     joint_im = joint_im.transpose((0, 2, 1, 3))
+                #     s = joint_im.shape
+                #     joint_im = joint_im.reshape((s[0]*s[1], s[2]*s[3]))
+                #     imwrite(osp.join("masks", "joint_{}.png".format(self.counter)), joint_im)
+                #     self.counter += 1
 
-            # if self.counter == 50:
-            #     assert False
+                # if self.counter == 50:
+                #     assert False
 
-            # Make the masks the same
-            mask_label = (mask_pred_filter > mask_tresh).float()
-            train_instance = select_mask[:, 2]
-            train_label = (train_instance > mask_tresh_other).float()
-            # loss_physics = torch.pow(mask_pred_filter - select_mask[:, 2], 2).mean()
-            loss_physics = (((-mask_label) * (train_instance + 1e-5).log() - (1 - mask_label) * (1 - train_instance + 1e-5).log())).mean()
-            loss_physics = ((-train_label) * (mask_pred_filter + 1e-5).log() - (1 - train_label) * (1 - mask_pred_filter + 1e-5).log()).mean() + loss_physics
+                # Make the masks the same
+                mask_label = (mask_pred_filter > mask_tresh).float()
+                train_instance = select_mask[:, 2]
+                train_label = (train_instance > mask_tresh_other).float()
+                # loss_physics = torch.pow(mask_pred_filter - select_mask[:, 2], 2).mean()
+                loss_physics = (((-mask_label) * (train_instance + 1e-5).log() - (1 - mask_label) * (1 - train_instance + 1e-5).log())).mean()
+                loss_physics = ((-train_label) * (mask_pred_filter + 1e-5).log() - (1 - train_label) * (1 - mask_pred_filter + 1e-5).log()).mean() + loss_physics
 
-            # This is the solution for adept
-            # self.loss_physics = loss_physics * 100.0
-            # self.loss_prim_next = loss_prim_next * 1.0
+                # This is the solution for adept
+                # self.loss_physics = loss_physics * 100.0
+                # self.loss_prim_next = loss_prim_next * 1.0
 
-            # This is the solution for blocks
-            # self.loss_physics = loss_physics * 10.0
-            # self.loss_prim_next = loss_prim_next * 10.0
+                # This is the solution for blocks
+                # self.loss_physics = loss_physics * 10.0
+                # self.loss_prim_next = loss_prim_next * 10.0
 
-            # Else
-            self.loss_physics = loss_physics * 100.0
-            self.loss_prim_next = loss_prim_next * 1.0
+                # Else
+                self.loss_physics = loss_physics * 100.0
+                self.loss_prim_next = loss_prim_next * 1.0
 
         self.b = torch.cat(b, dim=1)
         self.m = torch.cat(m, dim=1)
