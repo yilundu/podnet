@@ -223,7 +223,7 @@ class MONetModel(BaseModel):
                 if self.opt.dataset_mode == "block":
                     null_tresh = 300
                 else:
-                    null_tresh = 50
+                    null_tresh = 400
 
                 # For now let's use the threshold pixel of 50
                 mask_valid = select_mask.sum(dim=[2, 3]) > null_tresh
@@ -261,13 +261,14 @@ class MONetModel(BaseModel):
 
                 # Use the last state to infer the set of valid objects
                 mask_valid = mask_valid.view(-1, 3, s[1])[:, 1, :]
-                dist = torch.norm(prim_next[:, :, :3] - self.camera_pose[None, None, :], p=2, dim=2)
+                # dist = torch.norm(prim_next[:, :, 2:3], p=2, dim=2)
+                dist = prim_next[:, :, 2]
 
                 dist_idx = torch.argsort(dist, dim=1)
                 mask_pred_total = torch.zeros_like(mask_pred[:, 0:1])
-                mask_pred_total.requires_grad_(True)
+                # mask_pred_total.requires_grad_(True)
                 mask_pred_filter = torch.zeros_like(mask_pred)
-                mask_pred_filter.requires_grad_(True)
+                # mask_pred_filter.requires_grad_(True)
                 select_mask = select_mask.view(-1, 3, sm[1], 1, sm[2], sm[3])
                 # Filter through each element of the predict mask based off distance to handle occlusions between objects
 
